@@ -1,0 +1,11 @@
+# Databricks App runtime config for the Weather MCP server.
+# The runtime substitutes DATABRICKS_APP_PORT into the process and expects
+# the app to bind to 0.0.0.0. No secrets are required for Open-Meteo.
+command: ["python", "weather_mcp_server.py"]
+
+env:
+  - name: "WEATHER_PROVIDER"
+    value: "open-meteo"
+  # If you switch to a keyed provider (e.g. WeatherAPI.com), do NOT put the key
+  # here. Store it with setup_secrets.py and read it in weather_broker.py via
+  # the _secret() helper (WorkspaceClient().secrets.get_secret(...)).
