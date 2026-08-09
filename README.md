@@ -1,82 +1,105 @@
-# Weather-Prediction MCP Server + Agent (Day 3)
+# Weather Intelligence — Unstructured Data → Lakebase Vector Search → REST API
 
-A custom **Model Context Protocol (MCP)** server that exposes weather-forecast
-tools, plus a Databricks agent that uses those tools to answer natural-language
-weather questions. Built as a Databricks App, following the Day 3 reference
-pattern (`mcp_server/` FastMCP server + adapter module split).
+This module extends the `databricks-lakebase-app-day-2` app with a weather
+pipeline: harvest free-text weather data, embed it, store it in Lakebase
+(Postgres + pgvector), and retrieve it by semantic similarity through the Flask
+API.
 
-## Weather API + auth
+## Data source and why
 
-- **Provider:** [Open-Meteo](https://open-meteo.com) — free, **no API key, no
-  sign-up**. Non-commercial use up to ~10,000 calls/day.
-- **Auth:** none required. Because Open-Meteo is keyless, no Databricks secret
-  is needed. A `_secret()` helper and `setup_secrets.py` are included for the
-  case where you swap in a keyed provider (e.g. WeatherAPI.com) — the key is
-  then read at runtime, never hardcoded or committed.
+**National Weather Service API (`api.weather.gov`).** It is free, needs no API
+key, and returns rich narrative text that is well suited to embedding:
 
-## Architecture
+- `GET /alerts/active?area={ST}` — active alerts with free-text `description`
+  and `instruction` fields.
+- `GET /gridpoints/.../forecast` (reached via the `forecast` URL from
+  `GET /points/{lat},{lon}`) — multi-period forecasts, each with a
+  `detailedForecast` narrative.
 
-```
-User ──▶ Databricks Agent (LLM + system prompt)
-             │  tool calls (MCP)
-             ▼
-   Weather MCP server  ── Databricks App ──▶  https://<app-url>/mcp
-             │  (thin @mcp.tool functions)
-             ▼
-   weather_broker.py  (adapter: all HTTP + parsing)
-             │
-             ▼
-   Open-Meteo  (geocoding + forecast APIs)
-```
+No API key means the work stays focused on harvesting, vectorization, and
+retrieval rather than auth plumbing. The one requirement is a descriptive
+`User-Agent` header on every request; without it NWS returns HTTP 403. This is
+set via the `WEATHER_USER_AGENT` environment variable, so no contact email is
+hard-coded.
 
-## Tools
+Locations are accepted either as `"lat,lon"` (used directly) or as `"City, ST"`.
+City/state is resolved to coordinates with a small built-in table for common
+cities, falling back to the free OpenStreetMap Nominatim geocoder.
 
-| Tool | What it does |
-|------|--------------|
-| `get_current_weather(location)` | Current temp, conditions, humidity, wind. |
-| `get_forecast(location, days=3)` | Daily highs/lows, precip chance, conditions. |
-| `predict_umbrella_needed(location, date)` | Derived call: umbrella recommended if day's precip probability ≥ 40%. |
-| `compare_cities(a, b)` *(stretch)* | Which of two cities is warmer / wetter now. |
+## Schema decisions
 
-`get_current_weather`, `get_forecast`, and `predict_umbrella_needed` are the
-three required tools. The umbrella tool applies a threshold and explains its
-reasoning rather than echoing raw API output.
+Two tables mirror the `ticker_news_documents` / `ticker_news_embeddings`
+pattern.
+
+`weather_documents` (raw, one row per alert or forecast period):
+
+| column | type | notes |
+| --- | --- | --- |
+| `id` | TEXT PK | alert id, or `forecast:<sha1>` for forecasts (stable dedup key) |
+| `location` | TEXT | `City, ST` or `areaDesc` |
+| `source_type` | TEXT | `alert` or `forecast` |
+| `headline` | TEXT | event name, e.g. `Flash Flood Warning` |
+| `narrative_text` | TEXT | the free text that gets embedded |
+| `issued_at` | TIMESTAMPTZ | effective / start time |
+| `payload` | JSONB | raw JSON for provenance |
+| `synced_at` | TIMESTAMPTZ | `DEFAULT now()` |
+
+`weather_embeddings` (one row per chunk):
+
+| column | type | notes |
+| --- | --- | --- |
+| `id` | TEXT PK | `<document_id>:<chunk_index>` |
+| `document_id` | TEXT FK | references `weather_documents(id)` |
+| `chunk_index` | INT | |
+| `chunk_text` | TEXT | |
+| `embedding` | `vector(384)` | pgvector column |
+| `model_name` | TEXT | |
+| `created_at` | TIMESTAMPTZ | `DEFAULT now()` |
+
+- **Embedding model:** `sentence-transformers/all-MiniLM-L6-v2` (384 dims), the
+  same model as the news pipeline, so both stay queryable with the same
+  distance conventions.
+- **Chunking:** sliding window, `CHUNK_SIZE=800`, `CHUNK_OVERLAP=100` (character
+  based), matching the news pipeline. Most NWS text fits in a single chunk;
+  chunking only matters for long combined alert + instruction bodies.
+- **Index:** `CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)` for
+  cosine retrieval via the `<=>` operator.
 
 ## Files
 
-```
-mcp_server/
-  weather_mcp_server.py   # FastMCP server; thin @mcp.tool functions (mirrors alpaca_mcp_server.py)
-  weather_broker.py       # adapter: geocoding + forecast HTTP calls + parsing (mirrors alpaca_broker.py)
-  requirements.txt        # fastmcp, requests, databricks-sdk
-  app.yaml                # Databricks App runtime config
-  setup_secrets.py        # OPTIONAL: only for a keyed provider
-  test_local.py           # local smoke test (proves the pipeline before deploy)
-agent/
-  system_prompt.md        # agent system prompt (guardrails + tool routing)
-  tools.md                # tool list + how the MCP server is registered
-.env.example              # local env template (no real secrets)
-.gitignore                # ignores .env and caches
-```
+- `weather_client.py` — NWS client (mirrors `massive_client.py`).
+- `app.py` — adds `POST /weather/sync` and `POST /weather/search` (see
+  `app_weather_additions.py` for the exact blocks).
+- `sql/weather_tables.sql` — DDL for both tables (the app also creates them
+  automatically).
+- `notebooks/ingest_weather_embeddings.py` — psycopg2 embedding job.
+- `requirements.txt` — add `sentence-transformers`.
 
-## Setup (summary)
+## Run the pipeline end to end
 
-1. `pip install -r mcp_server/requirements.txt`
-2. `python mcp_server/test_local.py` — confirm the adapter works locally.
-3. Push this repo to a **public** GitHub repo (confirm no secrets committed).
-4. In Databricks: create a **Git folder** from the repo, then create a
-   **Databricks App** pointing at `mcp_server/`. The MCP endpoint is
-   `https://<app-url>/mcp`.
-5. Register that URL as an **external MCP** in **AI Gateway**, then build an
-   **Agent Bricks** agent (Custom LLM), add the MCP server under Tools, set the
-   system prompt from `agent/system_prompt.md`, and test with natural-language
-   questions.
+1. Install deps: `pip install -r requirements.txt`.
+2. Sync documents:
+   ```
+   curl -X POST "$APP_URL/weather/sync" \
+     -H "Content-Type: application/json" \
+     -d '{"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}'
+   ```
+3. Embed: run `notebooks/ingest_weather_embeddings.py` in Databricks (Run All)
+   or as a script wherever `lakebase.get_connection()` works.
+4. Search:
+   ```
+   curl -X POST "$APP_URL/weather/search" \
+     -H "Content-Type: application/json" \
+     -d '{"query": "flash flood risk this weekend", "top_k": 5}'
+   ```
 
-Full instructions are in `STEP_BY_STEP_GUIDE.md`.
+## Known limitations / future improvements
 
-## Notes
-
-- Endpoint transport is streamable HTTP (required for Databricks custom MCP
-  servers). The server binds to `0.0.0.0` and the `DATABRICKS_APP_PORT` the
-  Apps runtime injects.
-- No secrets are committed. Keep any keyed-provider key in a Databricks secret.
+- Alerts are fetched per state, so two cities in one state share the same alert
+  set (deduplicated on `id`).
+- Geocoding beyond the built-in city list depends on Nominatim availability and
+  its 1 request/second policy.
+- Re-running `/weather/sync` upserts on `id`, so it will not create duplicates.
+- Possible extensions: an LLM summary of the top results (basic RAG), a
+  `source_type` filter on retrieval, a scheduled re-sync job, and an
+  HNSW-vs-no-index latency benchmark.
